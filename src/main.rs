@@ -10,6 +10,11 @@ use std::thread;
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 
+use mysql::Pool;
+use mysql::prelude::Queryable;
+
+// use postgres::{Connection, TlsMode};
+
 static WAIT_READ_MS: Duration = Duration::from_millis(10);
 static WAIT_WRITE_MS: Duration = Duration::from_millis(100);
 
@@ -38,7 +43,23 @@ fn read_fifo(arc: Arc<Mutex<VecDeque<String>>>, path: &String) {
     }
 }
 
-fn write_db(arc: Arc<Mutex<VecDeque<String>>>, _url: &String) {
+fn write_db(arc: Arc<Mutex<VecDeque<String>>>, url: &String) {
+
+    let mut conn;
+    let mut execute;
+
+    // if url.starts_with("postgresql") {
+    //     conn = Connection::connect(url, TlsMode::None).unwrap();
+    //     execute = | query: &String | -> bool { conn.execute(query, &[]).unwrap(); return true; };
+    // }
+    if url.starts_with("mysql") {
+        let pool = Pool::new(url).unwrap();
+        conn = pool.get_conn().unwrap();
+        execute = | query: &String | conn.query_drop(query);
+    }
+    else {
+        panic!("no database");
+    }
 
     loop {
         let query;
@@ -48,7 +69,9 @@ fn write_db(arc: Arc<Mutex<VecDeque<String>>>, _url: &String) {
         }
 
         if query.is_some() {
-            println!("written - {}", query.unwrap());
+            let query_str = query.unwrap();
+            let res = execute(&query_str);
+            println!("written({}) - {}", res.is_ok(), query_str);
         }
         else {
             sleep(WAIT_WRITE_MS);
