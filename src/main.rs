@@ -10,13 +10,63 @@ use std::thread;
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 
-use mysql::Pool;
+use mysql::{Pool, PooledConn};
 use mysql::prelude::Queryable;
 
-// use postgres::{Connection, TlsMode};
+use postgres::{Client, NoTls};
 
 static WAIT_READ_MS: Duration = Duration::from_millis(10);
 static WAIT_WRITE_MS: Duration = Duration::from_millis(100);
+
+trait DbConn {
+    fn execute(&mut self, query: &String) -> bool;
+}
+
+impl DbConn for Client {
+    fn execute(&mut self, query: &String) -> bool {
+        self.batch_execute(query).is_ok()
+    }
+}
+
+impl DbConn for PooledConn {
+    fn execute(&mut self, query: &String) -> bool {
+        self.query_drop(query).is_ok()
+    }
+}
+
+fn write_db(arc: Arc<Mutex<VecDeque<String>>>, url: &String) {
+
+    let mut db: Box<dyn DbConn>;
+
+    if url.starts_with("postgresql") {
+        db = Box::new(Client::connect(url, NoTls).unwrap());
+    }
+    else if url.starts_with("mysql") {
+        let pool = Pool::new(url).unwrap();
+        db = Box::new(pool.get_conn().unwrap());
+    }
+    else {
+        panic!("no database");
+    }
+
+    loop {
+        let query;
+        {
+            let mut queries = arc.lock().unwrap();
+            query = queries.pop_front();
+        }
+
+        if query.is_some() {
+            let query_str = query.unwrap();
+            let res = db.execute(&query_str);
+            println!("written({}) - {}", res, query_str);
+        }
+        else {
+            sleep(WAIT_WRITE_MS);
+        }
+    }
+
+}
 
 fn read_fifo(arc: Arc<Mutex<VecDeque<String>>>, path: &String) {
 
@@ -41,43 +91,6 @@ fn read_fifo(arc: Arc<Mutex<VecDeque<String>>>, path: &String) {
             sleep(WAIT_READ_MS);
         }
     }
-}
-
-fn write_db(arc: Arc<Mutex<VecDeque<String>>>, url: &String) {
-
-    let mut conn;
-    let mut execute;
-
-    // if url.starts_with("postgresql") {
-    //     conn = Connection::connect(url, TlsMode::None).unwrap();
-    //     execute = | query: &String | -> bool { conn.execute(query, &[]).unwrap(); return true; };
-    // }
-    if url.starts_with("mysql") {
-        let pool = Pool::new(url).unwrap();
-        conn = pool.get_conn().unwrap();
-        execute = | query: &String | conn.query_drop(query);
-    }
-    else {
-        panic!("no database");
-    }
-
-    loop {
-        let query;
-        {
-            let mut queries = arc.lock().unwrap();
-            query = queries.pop_front();
-        }
-
-        if query.is_some() {
-            let query_str = query.unwrap();
-            let res = execute(&query_str);
-            println!("written({}) - {}", res.is_ok(), query_str);
-        }
-        else {
-            sleep(WAIT_WRITE_MS);
-        }
-    }
-
 }
 
 fn main() {
