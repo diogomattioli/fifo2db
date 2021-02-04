@@ -3,92 +3,118 @@ use std::env;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
-use std::thread::sleep;
 use std::time::Duration;
 
-use std::thread;
-use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
+use std::thread::{self, sleep};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
-use mysql::{Pool, PooledConn};
-use mysql::prelude::Queryable;
-
+use io::Read;
 use postgres::{Client, NoTls};
+use mysql::{Pool, PooledConn, prelude::Queryable};
 
-static WAIT_READ_MS: Duration = Duration::from_millis(10);
-static WAIT_WRITE_MS: Duration = Duration::from_millis(100);
+static WAIT_READ: Duration = Duration::from_millis(10);
+static WAIT_CONNECT: Duration = Duration::from_secs(3);
 
 trait DbConn {
-    fn execute(&mut self, query: &String) -> bool;
+    fn execute(&mut self, query: &str) -> bool;
+    fn is_alive(&mut self) -> bool;
+}
+
+impl DbConn for () {
+    fn execute(&mut self, _query: &str) -> bool {
+        false
+    }
+    fn is_alive(&mut self) -> bool {
+        false
+    }
 }
 
 impl DbConn for Client {
-    fn execute(&mut self, query: &String) -> bool {
+    fn execute(&mut self, query: &str) -> bool {
         self.batch_execute(query).is_ok()
+    }
+    fn is_alive(&mut self) -> bool {
+        self.is_closed()
     }
 }
 
 impl DbConn for PooledConn {
-    fn execute(&mut self, query: &String) -> bool {
+    fn execute(&mut self, query: &str) -> bool {
         self.query_drop(query).is_ok()
     }
+    fn is_alive(&mut self) -> bool {
+        true
+    }
 }
 
-fn write_db(arc: Arc<Mutex<VecDeque<String>>>, url: &String) {
-
-    let mut db: Box<dyn DbConn>;
+fn get_conn(url: &str) -> Result<Box<dyn DbConn>, (bool, String)> {
 
     if url.starts_with("postgresql") {
-        db = Box::new(Client::connect(url, NoTls).unwrap());
+        match Client::connect(url, NoTls) {
+            Ok(conn) => return Ok(Box::new(conn)),
+            Err(e) => return Err((false, e.to_string())),
+        }
     }
     else if url.starts_with("mysql") {
-        let pool = Pool::new(url).unwrap();
-        db = Box::new(pool.get_conn().unwrap());
-    }
-    else {
-        panic!("no database");
-    }
-
-    loop {
-        let query;
-        {
-            let mut queries = arc.lock().unwrap();
-            query = queries.pop_front();
-        }
-
-        if query.is_some() {
-            let query_str = query.unwrap();
-            let res = db.execute(&query_str);
-            println!("written({}) - {}", res, query_str);
-        }
-        else {
-            sleep(WAIT_WRITE_MS);
+        match Pool::new(url) {
+            Ok(pool) => {
+                match pool.get_conn() {
+                    Ok(conn) => return Ok(Box::new(conn)),
+                    Err(e) => return Err((false, e.to_string())),
+                }        
+            }
+            Err(e) => return Err((false, e.to_string())),
         }
     }
 
+    Err((true, "no database!".to_string()))
 }
 
-fn read_fifo(arc: Arc<Mutex<VecDeque<String>>>, path: &String) {
+fn write_db(rx: Receiver<String>, url: &str) {
+
+    let mut db: Box<dyn DbConn> = Box::new(());
+
+    loop {
+        if !db.is_alive() {
+            match get_conn(url) {
+                Ok(conn) => db = conn,
+                Err((true, _)) => return,
+                Err((false, e)) => {
+                    println!("{}", e);
+                    sleep(WAIT_CONNECT);
+                    continue;
+                },
+            }
+        }
+
+        match rx.recv() {
+            Ok(query) => {
+                let res = db.execute(&query);
+                println!("written({}) - {}", res, &query);        
+            },
+            Err(_) => {
+                println!("closing write!");
+                return;
+            }
+        }
+    }
+}
+
+fn read_fifo(tx: Sender<String>, path: &str) {
 
     let full_path = Path::new(&path);
 
-    let file = match File::open(&full_path) {
-        Err(reason) => panic!("could not open {}: {}", full_path.display(), reason),
-        Ok(file) => file,
-    };
-
+    let file = File::open(&full_path).expect("could not open file");
     let mut buf = io::BufReader::new(file);
+
     loop {
-        let mut query = String::new();
-        let size = buf.read_line(&mut query).unwrap();
-        if size > 0 {
-            query.remove(query.len() - 1);
-            println!("read    - {}", query);
-            let mut queries = arc.lock().unwrap();
-            queries.push_back(query);
-        }
-        else {
-            sleep(WAIT_READ_MS);
+        sleep(WAIT_READ);
+
+        for query in buf.by_ref().lines() {
+            if !tx.send(query.unwrap()).is_ok() {
+                println!("closing read!");
+                return;
+            }
         }
     }
 }
@@ -104,22 +130,13 @@ fn main() {
 
     println!("{} {}", db_url, fifo_path);
 
-    let queries: VecDeque<String> = VecDeque::new();
-    let mutex = std::sync::Mutex::new(queries);
-    let arc = std::sync::Arc::new(mutex);
+    let (tx, rx) = channel::<String>();
 
-    let mut handles = VecDeque::new();
-    {
-        let arc = arc.clone();
-        let handle = thread::spawn(move || {
-            write_db(arc, &db_url);
-        });
-        handles.push_back(handle);
-    }
+    let handle = thread::spawn(move || {
+        write_db(rx, &db_url);
+    });
 
-    read_fifo(arc, &fifo_path);
+    read_fifo(tx, &fifo_path);
 
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    handle.join().unwrap();
 }
