@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, sync::{Arc, Mutex}, thread::JoinHandle};
 
 use std::fs::File;
 use std::io::{self, BufRead};
@@ -8,94 +8,35 @@ use std::time::Duration;
 use std::thread::{self, sleep};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use diesel::{RunQueryDsl, sql_query};
 use io::Read;
-use postgres::{Client, NoTls};
-use mysql::{Pool, PooledConn, prelude::Queryable};
+use r2d2::Pool;
+use r2d2_diesel::ConnectionManager;
 
 static WAIT_READ: Duration = Duration::from_millis(10);
 static WAIT_CONNECT: Duration = Duration::from_secs(3);
 
-trait DbConn {
-    fn execute(&mut self, query: &str) -> bool;
-    fn is_alive(&mut self) -> bool;
-}
+pub type DbConnection = diesel::pg::PgConnection;
 
-impl DbConn for () {
-    fn execute(&mut self, _query: &str) -> bool {
-        false
-    }
-    fn is_alive(&mut self) -> bool {
-        false
-    }
-}
-
-impl DbConn for Client {
-    fn execute(&mut self, query: &str) -> bool {
-        self.batch_execute(query).is_ok()
-    }
-    fn is_alive(&mut self) -> bool {
-        self.is_closed()
-    }
-}
-
-impl DbConn for PooledConn {
-    fn execute(&mut self, query: &str) -> bool {
-        self.query_drop(query).is_ok()
-    }
-    fn is_alive(&mut self) -> bool {
-        true
-    }
-}
-
-fn get_conn(url: &str) -> Result<Box<dyn DbConn>, (bool, String)> {
-
-    if url.starts_with("postgresql") {
-        match Client::connect(url, NoTls) {
-            Ok(conn) => return Ok(Box::new(conn)),
-            Err(e) => return Err((false, e.to_string())),
-        }
-    }
-    else if url.starts_with("mysql") {
-        match Pool::new(url) {
-            Ok(pool) => {
-                match pool.get_conn() {
-                    Ok(conn) => return Ok(Box::new(conn)),
-                    Err(e) => return Err((false, e.to_string())),
-                }        
-            }
-            Err(e) => return Err((false, e.to_string())),
-        }
-    }
-
-    Err((true, "no database!".to_string()))
-}
-
-fn write_db(rx: Receiver<String>, url: &str) {
-
-    let mut db: Box<dyn DbConn> = Box::new(());
+fn write_db(rx: Arc<Mutex<Receiver<String>>>, pool: Pool<ConnectionManager<DbConnection>>) {
 
     loop {
-        if !db.is_alive() {
-            match get_conn(url) {
-                Ok(conn) => db = conn,
-                Err((true, _)) => return,
-                Err((false, e)) => {
-                    println!("{}", e);
-                    sleep(WAIT_CONNECT);
-                    continue;
-                },
+        let received = rx.lock().unwrap().recv();
+
+        if let Ok(query) = received {
+            loop {
+                if let Ok(conn) = pool.get() {
+                    let res = sql_query(&query).execute(&(*conn));
+                    println!("written({}) - {}", res.is_ok(), &query);       
+                    break;
+                }
+
+                sleep(WAIT_CONNECT);
             }
         }
-
-        match rx.recv() {
-            Ok(query) => {
-                let res = db.execute(&query);
-                println!("written({}) - {}", res, &query);        
-            },
-            Err(_) => {
-                println!("closing write!");
-                return;
-            }
+        else {
+            println!("closing write!");
+            return;
         }
     }
 }
@@ -108,35 +49,59 @@ fn read_fifo(tx: Sender<String>, path: &str) {
     let mut buf = io::BufReader::new(file);
 
     loop {
-        sleep(WAIT_READ);
-
         for query in buf.by_ref().lines() {
             if !tx.send(query.unwrap()).is_ok() {
                 println!("closing read!");
                 return;
             }
         }
+
+        sleep(WAIT_READ);
     }
 }
 
 fn main() {
 
     if env::args().count() < 3 {
-        panic!("no arguments");
+        panic!("usage: {} fifo_path pool_url [pool_size]", env::args().nth(0).unwrap());
     }
 
-    let fifo_path = env::args().nth(2).unwrap();
-    let db_url = env::args().nth(1).unwrap();
+    let fifo_path = env::args().nth(1).unwrap();
+    let pool_url = env::args().nth(2).unwrap();
+    let mut pool_size = 3;
 
-    println!("{} {}", db_url, fifo_path);
+    if let Some(str) = env::args().nth(3) {
+        if let Ok(v) = u8::from_str_radix(&str, 10) {
+            if v > 0 {
+                pool_size = v;
+            }
+        }
+    }
+
+    println!("{} {}", pool_url, fifo_path);
+
+    let manager = ConnectionManager::<DbConnection>::new(pool_url);
+    let pool = Pool::builder()
+        .max_size(pool_size as u32)
+        .build(manager)
+        .expect("failed to create pool");
 
     let (tx, rx) = channel::<String>();
-
-    let handle = thread::spawn(move || {
-        write_db(rx, &db_url);
-    });
+    let arc_rx = Arc::new(Mutex::new(rx));
+    
+    let mut handles: Vec<JoinHandle<()>> = vec![];
+    for _ in 1..=pool_size {
+        let rx = Arc::clone(&arc_rx);
+        let pool = pool.clone();
+        let handle = thread::spawn(move || {
+            write_db(rx, pool);
+        });
+        handles.push(handle);
+    }
 
     read_fifo(tx, &fifo_path);
 
-    handle.join().unwrap();
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }

@@ -7,13 +7,12 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-postgres = "0.18.1"
-mysql = "20.1.0"
+diesel = { version = "1.4", features = ["postgres"] }
+r2d2 = "0.8"
+r2d2-diesel = "1.0"
 
 [profile.release]
 debug = false
 opt-level = 3
-#opt-level = 'z'  # Optimize for size.
-#lto = true
-#codegen-units = 1
-#panic = 'abort'
+lto = true
+panic = 'abort'
